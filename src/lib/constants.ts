@@ -34,7 +34,7 @@ export const pricing = [
   {
     id: "10201",
     plan: "Our Plan",
-    price: "$59",
+    price: "$69",
     features: [
       "1 Vehicle Report",
       "Vehicle Specification",
@@ -48,6 +48,6 @@ export const pricing = [
 ];
 
 /** Report checkout display price (Polar product is priced in the Polar dashboard). */
-export const REPORT_PRICE_DISPLAY = "$59";
-export const REPORT_PRICE_CENTS = 5900;
+export const REPORT_PRICE_DISPLAY = "$69";
+export const REPORT_PRICE_CENTS = 6900;
 export const REPORT_CURRENCY = "usd";
