@@ -7,6 +7,7 @@ import {
   type ClearVinPreviewSummary,
 } from "@/lib/clearvin/extract-preview-vehicle";
 import { extractVehicleSummaryFromClearVinHtml } from "@/lib/clearvin-vehicle-summary";
+import { extractReportIdFromClearVinPayload } from "@/lib/clearvin/extract-report-id";
 import { getVinValidationError, normalizeVin } from "@/lib/vin-validation";
 
 function mapClearVinFailure(e: unknown): string {
@@ -44,7 +45,8 @@ export async function fetchClearVinReport(vin: string): Promise<{
     return {
       success: true,
       html,
-      reportId: result.reportId,
+      reportId:
+        result.reportId || extractReportIdFromClearVinPayload(html, null),
     };
   } catch (e) {
     console.error("[ClearVIN] fetchClearVinReport:", e);

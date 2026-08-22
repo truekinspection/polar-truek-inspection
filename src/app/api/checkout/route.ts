@@ -3,8 +3,8 @@ import { Checkout } from "@polar-sh/nextjs";
 import { appOrigin, getPolarServerMode } from "@/lib/polar";
 
 /**
- * Official Polar Checkout adapter (hosted redirect).
- * Primary app flow uses POST /api/create-checkout with customer + VIN prefills.
+ * Official Polar Checkout adapter (unused by the Check VIN flow).
+ * Primary app flow: POST /api/create-checkout + Polar Embedded Checkout.
  */
 export const GET = Checkout({
   accessToken: process.env.POLAR_ACCESS_TOKEN,

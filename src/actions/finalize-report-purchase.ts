@@ -9,8 +9,31 @@ import { computeReportPreviewExpiry } from "@/lib/report-preview-access";
 import { REPORT_PRICE_DISPLAY } from "@/lib/constants";
 import { getPolarServer, getVinCustomFieldSlug } from "@/lib/polar";
 import { fetchClearVinReport } from "@/actions/clearvin";
+import { extractReportIdFromClearVinPayload } from "@/lib/clearvin/extract-report-id";
 import { CheckoutStatus } from "@polar-sh/sdk/models/components/checkoutstatus";
 import { normalizeVin } from "@/lib/vin-validation";
+
+const STALE_PENDING_MS = 70_000;
+const WAITER_TIMEOUT_MS = 45_000;
+
+type FulfillResult =
+  | { success: true; token: string }
+  | { success: false; error: string };
+
+const inFlightByOrder = new Map<string, Promise<FulfillResult>>();
+
+function isUniqueConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error as { code: unknown }).code === "P2002"
+  );
+}
+
+function uniqueIds(...ids: Array<string | null | undefined>): string[] {
+  return [...new Set(ids.map((id) => (typeof id === "string" ? id.trim() : "")).filter(Boolean))];
+}
 
 function generateToken(): string {
   return randomBytes(32).toString("hex");
@@ -60,19 +83,83 @@ function extractVin(
 }
 
 async function findExistingTokenForOrder(
-  transactionId: string,
+  transactionIds: string | string[],
   vin: string,
 ): Promise<string | null> {
-  const existing = await db.payment.findUnique({
-    where: { orderID: transactionId },
+  const ids = uniqueIds(
+    ...(Array.isArray(transactionIds) ? transactionIds : [transactionIds]),
+  );
+  if (!ids.length) return null;
+
+  const existing = await db.payment.findFirst({
+    where: { orderID: { in: ids }, status: "COMPLETED" },
   });
   if (!existing) return null;
 
   const tokenRow = await db.reportPreviewToken.findFirst({
-    where: { vin: vin.trim() },
+    where: {
+      vin: vin.trim(),
+      createdAt: { gte: new Date(existing.createdAt.getTime() - 5_000) },
+    },
     orderBy: { createdAt: "desc" },
   });
   return tokenRow?.token ?? null;
+}
+
+async function waitForExistingToken(
+  transactionIds: string[],
+  vin: string,
+): Promise<string | null> {
+  const started = Date.now();
+  while (Date.now() - started < WAITER_TIMEOUT_MS) {
+    const token = await findExistingTokenForOrder(transactionIds, vin);
+    if (token) return token;
+    await sleep(400);
+  }
+  return findExistingTokenForOrder(transactionIds, vin);
+}
+
+/**
+ * Atomically claims the ClearVIN fetch for this Polar checkout/order.
+ * The unique Payment.orderID row is the idempotency key.
+ */
+async function claimFulfillmentSlot(params: {
+  canonicalId: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+}): Promise<"fetcher" | "waiter"> {
+  try {
+    await db.payment.create({
+      data: {
+        firstName: params.firstName,
+        lastName: params.lastName,
+        email: params.email,
+        plan: `Vehicle History Report — ${REPORT_PRICE_DISPLAY}`,
+        orderID: params.canonicalId,
+        status: "PENDING",
+      },
+    });
+    return "fetcher";
+  } catch (error) {
+    if (!isUniqueConstraintError(error)) throw error;
+
+    const existing = await db.payment.findUnique({
+      where: { orderID: params.canonicalId },
+    });
+    if (!existing) return "waiter";
+    if (existing.status === "COMPLETED") return "waiter";
+
+    const ageMs = Date.now() - existing.createdAt.getTime();
+    if (existing.status === "PENDING" && ageMs > STALE_PENDING_MS) {
+      console.warn(
+        "[fulfillPurchase] reclaiming stale PENDING fulfillment",
+        params.canonicalId,
+      );
+      return "fetcher";
+    }
+    return "waiter";
+  }
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -144,7 +231,10 @@ async function persistAndEmail(params: {
   const { firstName, lastName } = splitCustomerName(params.customerDisplayName);
   const token = generateToken();
   const expiresAt = computeReportPreviewExpiry();
-  const reportIdStr = params.clearvinReportId?.trim() || null;
+  const reportIdStr =
+    params.clearvinReportId?.trim() ||
+    extractReportIdFromClearVinPayload(params.html, null) ||
+    null;
 
   try {
     await db.$transaction(
@@ -158,13 +248,21 @@ async function persistAndEmail(params: {
             expiresAt,
           },
         });
-        await tx.payment.create({
-          data: {
+        await tx.payment.upsert({
+          where: { orderID: transactionId },
+          create: {
             firstName,
             lastName,
             email,
             plan: `Vehicle History Report — ${REPORT_PRICE_DISPLAY}`,
             orderID: transactionId,
+            status: "COMPLETED",
+          },
+          update: {
+            firstName,
+            lastName,
+            email,
+            plan: `Vehicle History Report — ${REPORT_PRICE_DISPLAY}`,
             status: "COMPLETED",
           },
         });
@@ -256,12 +354,14 @@ async function fulfillPurchaseFromOrderData(input: {
   vehicleYear?: string;
   vehicleMake?: string;
   vehicleModel?: string;
-}): Promise<{ success: true; token: string } | { success: false; error: string }> {
+}): Promise<FulfillResult> {
   const vin = input.vin.trim();
   const email = input.customerEmail.trim();
   const transactionId = input.transactionId.trim();
   const checkoutId =
     typeof input.checkoutId === "string" ? input.checkoutId.trim() : "";
+  const canonicalId = checkoutId || transactionId;
+  const orderIds = uniqueIds(canonicalId, checkoutId, transactionId);
 
   if (!vin) {
     return { success: false, error: "VIN missing from order data." };
@@ -270,20 +370,77 @@ async function fulfillPurchaseFromOrderData(input: {
     return { success: false, error: "Customer email missing from order." };
   }
 
-  const existingByTx = await findExistingTokenForOrder(transactionId, vin);
-  if (existingByTx) {
-    return { success: true, token: existingByTx };
-  }
-  if (checkoutId && checkoutId !== transactionId) {
-    const existingByCheckout = await findExistingTokenForOrder(checkoutId, vin);
-    if (existingByCheckout) {
-      return { success: true, token: existingByCheckout };
-    }
+  const inflight = inFlightByOrder.get(canonicalId);
+  if (inflight) {
+    return inflight;
   }
 
-  const report = await fetchClearVinReport(vin);
+  const work = fulfillClaimedPurchase({
+    vin,
+    email,
+    canonicalId,
+    orderIds,
+    customerDisplayName: input.customerDisplayName,
+    vehicleYear: input.vehicleYear,
+    vehicleMake: input.vehicleMake,
+    vehicleModel: input.vehicleModel,
+  });
+  inFlightByOrder.set(canonicalId, work);
+  try {
+    return await work;
+  } finally {
+    inFlightByOrder.delete(canonicalId);
+  }
+}
+
+async function fulfillClaimedPurchase(input: {
+  vin: string;
+  email: string;
+  canonicalId: string;
+  orderIds: string[];
+  customerDisplayName: string;
+  vehicleYear?: string;
+  vehicleMake?: string;
+  vehicleModel?: string;
+}): Promise<FulfillResult> {
+  const existingToken = await findExistingTokenForOrder(input.orderIds, input.vin);
+  if (existingToken) {
+    return { success: true, token: existingToken };
+  }
+
+  const { firstName, lastName } = splitCustomerName(input.customerDisplayName);
+  const role = await claimFulfillmentSlot({
+    canonicalId: input.canonicalId,
+    firstName,
+    lastName,
+    email: input.email,
+  });
+
+  if (role === "waiter") {
+    const waited = await waitForExistingToken(input.orderIds, input.vin);
+    if (waited) {
+      return { success: true, token: waited };
+    }
+    return {
+      success: false,
+      error:
+        "Your report is still being prepared. Please refresh this page in a moment.",
+    };
+  }
+
+  console.info("[fulfillPurchase] ClearVIN report fetch once", {
+    polarOrderId: input.canonicalId,
+    vin: input.vin,
+  });
+
+  const report = await fetchClearVinReport(input.vin);
   if (!report.success || !report.html) {
     console.error("[fulfillPurchase] ClearVIN:", report.error);
+    await db.payment
+      .deleteMany({
+        where: { orderID: input.canonicalId, status: "PENDING" },
+      })
+      .catch(() => {});
     return {
       success: false,
       error: report.error || "Failed to fetch ClearVIN report.",
@@ -292,11 +449,11 @@ async function fulfillPurchaseFromOrderData(input: {
 
   return persistAndEmail({
     html: report.html,
-    vin,
+    vin: input.vin,
     clearvinReportId: report.reportId,
-    customerEmail: email,
+    customerEmail: input.email,
     customerDisplayName: input.customerDisplayName,
-    transactionId: checkoutId || transactionId,
+    transactionId: input.canonicalId,
     vehicleYear: input.vehicleYear,
     vehicleMake: input.vehicleMake,
     vehicleModel: input.vehicleModel,
@@ -320,6 +477,18 @@ export async function fulfillPolarOrderPaid(input: {
     return { success: false, error: "Missing order id." };
   }
 
+  let checkoutId =
+    typeof input.checkoutId === "string" ? input.checkoutId.trim() : "";
+  if (!checkoutId) {
+    try {
+      const order = await getPolarServer().orders.get({ id: orderId });
+      checkoutId =
+        typeof order.checkoutId === "string" ? order.checkoutId.trim() : "";
+    } catch (e) {
+      console.warn("[fulfillPolarOrderPaid] could not load checkout id", e);
+    }
+  }
+
   const metadata = input.metadata ?? {};
   const customFieldData = input.customFieldData ?? {};
   const vin = extractVin(customFieldData, metadata);
@@ -335,7 +504,7 @@ export async function fulfillPolarOrderPaid(input: {
 
   return fulfillPurchaseFromOrderData({
     transactionId: orderId,
-    checkoutId: input.checkoutId,
+    checkoutId: checkoutId || input.checkoutId,
     vin,
     customerEmail: email,
     customerDisplayName: displayName,
@@ -346,8 +515,9 @@ export async function fulfillPolarOrderPaid(input: {
 }
 
 /**
- * Called when Polar hosted checkout redirects to /report-preview?checkout_id=…
+ * Called after Polar Embedded Checkout succeeds (/report-preview?checkout_id=…).
  * Verifies payment, fulfills if the webhook has not finished yet, returns token.
+ * Shares the Polar checkout-id lock so ClearVIN is fetched at most once.
  */
 export async function resolvePaidCheckout(
   checkoutId: string,

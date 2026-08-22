@@ -60,15 +60,18 @@ function ReportPreviewContent() {
   const [resolvedVin, setResolvedVin] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const resolveOnceRef = useRef<string | null>(null);
 
-  // ── Resolve Polar hosted-checkout return, or load by token ───────────────
+  // ── Resolve Polar embedded-checkout success, or load by token ────────────
   useEffect(() => {
     let cancelled = false;
 
     async function run() {
       try {
-        // Polar success redirect: /report-preview?checkout_id={CHECKOUT_ID}
+        // Polar success: /report-preview?checkout_id={CHECKOUT_ID}
         if (checkoutId && !token) {
+          if (resolveOnceRef.current === checkoutId) return;
+          resolveOnceRef.current = checkoutId;
           const resolved = await resolvePaidCheckout(checkoutId);
           if (cancelled) return;
           if (!resolved.success) {

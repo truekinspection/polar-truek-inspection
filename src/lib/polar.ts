@@ -56,3 +56,30 @@ export function appOrigin(): string {
     "http://localhost:3000";
   return raw.replace(/\/+$/, "");
 }
+
+/**
+ * Origin Polar should treat as the embedding page
+ * (`embed_origin` on checkout sessions). Prefer the live request origin
+ * (ngrok / preview hosts) and fall back to the configured app URL.
+ */
+export function resolveEmbedOrigin(request?: Request): string {
+  if (request) {
+    const originHeader = request.headers.get("origin");
+    if (originHeader) {
+      try {
+        return new URL(originHeader).origin;
+      } catch {
+        /* ignore invalid Origin */
+      }
+    }
+    const referer = request.headers.get("referer");
+    if (referer) {
+      try {
+        return new URL(referer).origin;
+      } catch {
+        /* ignore invalid Referer */
+      }
+    }
+  }
+  return appOrigin();
+}

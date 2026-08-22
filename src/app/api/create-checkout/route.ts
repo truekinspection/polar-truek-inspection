@@ -5,6 +5,7 @@ import {
   getPolarProductId,
   getPolarServer,
   getVinCustomFieldSlug,
+  resolveEmbedOrigin,
 } from "@/lib/polar";
 
 export async function POST(request: Request) {
@@ -48,6 +49,7 @@ export async function POST(request: Request) {
     }
 
     const origin = appOrigin();
+    const embedOrigin = resolveEmbedOrigin(request);
     const customerName = `${firstName} ${lastName}`.trim();
     const vinFieldSlug = getVinCustomFieldSlug();
     const forwarded = request.headers.get("x-forwarded-for");
@@ -62,9 +64,11 @@ export async function POST(request: Request) {
       customerEmail: email,
       customerName,
       customerIpAddress: customerIp ?? null,
-      // Hosted checkout: Polar redirects here after successful payment.
+      // After embedded payment, Polar (or our success handler) lands here.
       successUrl: `${origin}/report-preview?checkout_id={CHECKOUT_ID}`,
       returnUrl: `${origin}/check-vin`,
+      // Required for Polar Embedded Checkout — iframe posts messages only to this origin.
+      embedOrigin,
       // Prefill Polar dashboard custom field (slug must match dashboard config).
       customFieldData: {
         [vinFieldSlug]: vin,

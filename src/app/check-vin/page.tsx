@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { PolarEmbedCheckout } from "@polar-sh/checkout/embed";
 import {
   Loader2,
   AlertTriangle,
@@ -25,15 +26,7 @@ type VehicleSummary = {
   year?: string;
   make?: string;
   model?: string;
-  trim?: string;
-  engine?: string;
-  style?: string;
-  madeIn?: string;
-  msrp?: string;
   previewImageURL?: string;
-  imagesAmount?: number;
-  auctionHistoryRecords?: number;
-  recallCount?: number;
 };
 
 function readVinFromClient(): string {
@@ -57,6 +50,20 @@ function readEmailFromClient(): string {
   return useUserStore.getState().email?.trim() || "";
 }
 
+function vehicleFromPreview(result: {
+  year?: string;
+  make?: string;
+  model?: string;
+  previewImageURL?: string;
+}): VehicleSummary {
+  return {
+    year: result.year,
+    make: result.make,
+    model: result.model,
+    previewImageURL: result.previewImageURL,
+  };
+}
+
 export default function CheckVinPage() {
   const router = useRouter();
   const vinFromStore = useUserStore((s) => s.vnNumber);
@@ -66,6 +73,14 @@ export default function CheckVinPage() {
   const [activeVin, setActiveVin] = useState("");
   const [vehicle, setVehicle] = useState<VehicleSummary | null>(null);
   const [checkoutBusy, setCheckoutBusy] = useState(false);
+  const embedRef = useRef<PolarEmbedCheckout | null>(null);
+
+  useEffect(() => {
+    return () => {
+      embedRef.current?.close();
+      embedRef.current = null;
+    };
+  }, []);
 
   // ── Verify VIN with ClearVIN (no report HTML on this page) ────────────────
   useEffect(() => {
@@ -94,20 +109,7 @@ export default function CheckVinPage() {
     void (async () => {
       const result = await verifyClearVinVin(normalizedVin);
       if (result.success) {
-        setVehicle({
-          year: result.year,
-          make: result.make,
-          model: result.model,
-          trim: result.trim,
-          engine: result.engine,
-          style: result.style,
-          madeIn: result.madeIn,
-          msrp: result.msrp,
-          previewImageURL: result.previewImageURL,
-          imagesAmount: result.imagesAmount,
-          auctionHistoryRecords: result.auctionHistoryRecords,
-          recallCount: result.recallCount,
-        });
+        setVehicle(vehicleFromPreview(result));
         setReportState("ready");
         return;
       }
@@ -119,7 +121,34 @@ export default function CheckVinPage() {
     })();
   }, [vinFromStore]);
 
-  const startHostedCheckout = async () => {
+  const retryVinVerification = () => {
+    const vin = normalizeVin(readVinFromClient() || activeVin);
+    if (!vin) return;
+    const err = getVinValidationError(vin);
+    if (err) {
+      setReportError(err);
+      setReportState("error");
+      return;
+    }
+    setActiveVin(vin);
+    setReportState("loading");
+    setReportError("");
+    void (async () => {
+      const result = await verifyClearVinVin(vin);
+      if (result.success) {
+        setVehicle(vehicleFromPreview(result));
+        setReportState("ready");
+      } else {
+        setReportError(
+          result.error ||
+            "Could not verify this VIN. Please check your VIN and try again.",
+        );
+        setReportState("error");
+      }
+    })();
+  };
+
+  const openEmbeddedCheckout = async () => {
     const vin = normalizeVin(readVinFromClient() || activeVin);
     if (!vin) {
       toast.error("VIN missing", {
@@ -167,6 +196,7 @@ export default function CheckVinPage() {
       });
       const json = (await res.json()) as {
         success?: boolean;
+        checkoutId?: string;
         checkoutUrl?: string;
         message?: string;
       };
@@ -182,12 +212,32 @@ export default function CheckVinPage() {
         return;
       }
 
-      // Hosted Polar checkout — leave the app and pay on Polar.
-      window.location.href = json.checkoutUrl;
+      embedRef.current?.close();
+      const checkout = await PolarEmbedCheckout.create(json.checkoutUrl, {
+        theme: "light",
+      });
+      embedRef.current = checkout;
+      setCheckoutBusy(false);
+
+      checkout.addEventListener("success", (event) => {
+        event.preventDefault();
+        const successUrl =
+          event.detail.successURL ||
+          (json.checkoutId
+            ? `/report-preview?checkout_id=${encodeURIComponent(json.checkoutId)}`
+            : "/report-preview");
+        window.location.assign(successUrl);
+      });
+
+      checkout.addEventListener("close", () => {
+        embedRef.current = null;
+        setCheckoutBusy(false);
+      });
     } catch (e) {
-      console.error("[check-vin] create checkout", e);
+      console.error("[check-vin] embedded checkout", e);
       toast.error("Checkout unavailable", {
-        description: "Could not start Polar checkout. Please try again.",
+        description:
+          "Could not open Polar checkout on this page. Confirm this host is listed under Polar Settings → Preferences → Embedding, then try again.",
       });
       setCheckoutBusy(false);
     }
@@ -200,43 +250,10 @@ export default function CheckVinPage() {
     vehicle?.year ? { label: "Year", value: vehicle.year } : null,
     vehicle?.make ? { label: "Make", value: vehicle.make } : null,
     vehicle?.model ? { label: "Model", value: vehicle.model } : null,
-    vehicle?.trim ? { label: "Trim", value: vehicle.trim } : null,
-    vehicle?.engine ? { label: "Engine", value: vehicle.engine } : null,
-    vehicle?.style ? { label: "Style", value: vehicle.style } : null,
-    vehicle?.madeIn ? { label: "Made in", value: vehicle.madeIn } : null,
-    vehicle?.msrp ? { label: "MSRP", value: vehicle.msrp } : null,
-    typeof vehicle?.auctionHistoryRecords === "number"
-      ? {
-          label: "Auction records",
-          value: String(vehicle.auctionHistoryRecords),
-        }
-      : null,
-    typeof vehicle?.recallCount === "number"
-      ? { label: "Active recalls", value: String(vehicle.recallCount) }
-      : null,
-    typeof vehicle?.imagesAmount === "number"
-      ? { label: "Images available", value: String(vehicle.imagesAmount) }
-      : null,
   ].filter(Boolean) as { label: string; value: string }[];
 
   return (
     <main className="max-w-[1920px] mx-auto relative overflow-hidden min-h-screen flex flex-col">
-      {checkoutBusy && (
-        <div className="fixed inset-0 z-[9999] bg-black/70 backdrop-blur-sm flex flex-col items-center justify-center gap-6">
-          <div className="bg-white rounded-2xl shadow-2xl p-10 flex flex-col items-center gap-5 max-w-sm mx-4">
-            <Loader2 className="h-12 w-12 text-custom_red animate-spin" />
-            <div className="text-center">
-              <p className="text-xl font-bold text-gray-800">
-                Redirecting to secure checkout
-              </p>
-              <p className="text-gray-500 text-sm mt-1">
-                You will complete payment on Polar&apos;s hosted checkout page…
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
       <Navbar />
       <div className="flex-1 mt-24 max-w-2xl mx-auto px-4 py-10 w-full">
         <div className="text-center mb-10">
@@ -280,48 +297,7 @@ export default function CheckVinPage() {
             <AlertTriangle className="h-10 w-10 text-custom_red mx-auto mb-3" />
             <p className="text-gray-800 mb-4">{reportError}</p>
             <div className="flex flex-wrap gap-3 justify-center">
-              <Button
-                variant="outline"
-                onClick={() => {
-                  const vin = normalizeVin(readVinFromClient() || activeVin);
-                  if (!vin) return;
-                  const err = getVinValidationError(vin);
-                  if (err) {
-                    setReportError(err);
-                    setReportState("error");
-                    return;
-                  }
-                  setActiveVin(vin);
-                  setReportState("loading");
-                  setReportError("");
-                  void (async () => {
-                    const result = await verifyClearVinVin(vin);
-                    if (result.success) {
-                      setVehicle({
-                        year: result.year,
-                        make: result.make,
-                        model: result.model,
-                        trim: result.trim,
-                        engine: result.engine,
-                        style: result.style,
-                        madeIn: result.madeIn,
-                        msrp: result.msrp,
-                        previewImageURL: result.previewImageURL,
-                        imagesAmount: result.imagesAmount,
-                        auctionHistoryRecords: result.auctionHistoryRecords,
-                        recallCount: result.recallCount,
-                      });
-                      setReportState("ready");
-                    } else {
-                      setReportError(
-                        result.error ||
-                          "Could not verify this VIN. Please check your VIN and try again.",
-                      );
-                      setReportState("error");
-                    }
-                  })();
-                }}
-              >
+              <Button variant="outline" onClick={retryVinVerification}>
                 Try again
               </Button>
               <Button
@@ -355,13 +331,11 @@ export default function CheckVinPage() {
                       {/* eslint-disable-next-line @next/next/no-img-element */}
                       <img
                         src={vehicle.previewImageURL}
-                        alt={[
-                          vehicle.year,
-                          vehicle.make,
-                          vehicle.model,
-                        ]
-                          .filter(Boolean)
-                          .join(" ") || "Vehicle preview"}
+                        alt={
+                          [vehicle.year, vehicle.make, vehicle.model]
+                            .filter(Boolean)
+                            .join(" ") || "Vehicle preview"
+                        }
                         className="h-auto max-h-64 w-full object-contain bg-gray-50"
                       />
                     </div>
@@ -391,9 +365,16 @@ export default function CheckVinPage() {
                 size="lg"
                 className="w-full max-w-md bg-custom_red/80 hover:bg-custom_red/100 text-white text-lg py-6 rounded-xl shadow-lg"
                 disabled={checkoutBusy}
-                onClick={() => void startHostedCheckout()}
+                onClick={() => void openEmbeddedCheckout()}
               >
-                Get Full Report for {REPORT_PRICE_DISPLAY}
+                {checkoutBusy ? (
+                  <span className="inline-flex items-center gap-2">
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                    Opening checkout…
+                  </span>
+                ) : (
+                  `Get Full Report for ${REPORT_PRICE_DISPLAY}`
+                )}
               </Button>
               <p className="max-w-md text-center text-xs text-gray-500">
                 NMVTIS-related records in this report are provided through
