@@ -18,6 +18,9 @@ export const metadata: Metadata = {
   title: "TrueK Inspection",
   description:
     "Get a Certified Vehicle History Report for just $69. Get your report now. Original and Actual Vehicle History Reports. Guaranteed Safe Checkout.",
+  verification: {
+    google: "TBbs3ucxUopm3Q_jtWwm5llzVUZtSovZxUftwF8wMC8",
+  },
 };
 
 const jsonLd = {
@@ -141,6 +144,10 @@ export default function RootLayout({
   return (
     <html lang="en">
       <head>
+        <meta
+          name="google-site-verification"
+          content="TBbs3ucxUopm3Q_jtWwm5llzVUZtSovZxUftwF8wMC8"
+        />
         <Script
           id="truek-jsonld"
           type="application/ld+json"
